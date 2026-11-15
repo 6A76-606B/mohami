@@ -22,6 +22,9 @@ jobs:
           npm i @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6 @capacitor/local-notifications@6
           npx cap init "مهامي" com.mohami.app --web-dir=www
           npx cap add android
+          F=$(find node_modules/@capacitor/local-notifications/android -name LocalNotificationManager.java)
+          sed -i 's/Notification buildNotification = mBuilder.build();/Notification buildNotification = mBuilder.build(); buildNotification.flags |= android.app.Notification.FLAG_INSISTENT;/' "$F"
+          grep -q FLAG_INSISTENT "$F" || echo "::warning::insistent patch not applied"
           sed -i 's#</manifest>#    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>\n    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM"/>\n    <uses-permission android:name="android.permission.USE_EXACT_ALARM"/>\n    <uses-permission android:name="android.permission.VIBRATE"/>\n    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>\n    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>\n</manifest>#' android/app/src/main/AndroidManifest.xml
           mkdir -p android/app/src/main/java/com/mohami/app
           cat > android/app/src/main/java/com/mohami/app/MainActivity.java << 'EOF'
@@ -65,8 +68,9 @@ jobs:
           python3 - << 'PY'
           import wave, struct, math
           sr = 22050
-          notes = [(784, 0), (988, .3), (1175, .6), (1568, .9), (1175, 1.6), (1568, 1.9), (1976, 2.2)]
-          buf = [0.0] * int(sr * 4.2)
+          base = [(784, 0), (988, .3), (1175, .6), (1568, .9), (1175, 1.6), (1568, 1.9), (1976, 2.2)]
+          notes = [(f, t + 4.2 * k) for k in range(8) for f, t in base]
+          buf = [0.0] * int(sr * 4.2 * 8)
           for f, t in notes:
               s = int(t * sr)
               for i in range(min(int(sr * 1.8), len(buf) - s)):
@@ -78,6 +82,24 @@ jobs:
           w.writeframes(b''.join(struct.pack('<h', int(v / m * 30000)) for v in buf))
           w.close()
           PY
+          pip install -q pillow
+          python3 - << 'PY2'
+          from PIL import Image
+          import glob
+          ic = Image.open('icon.png').convert('RGBA')
+          for d, n in [('mdpi',48),('hdpi',72),('xhdpi',96),('xxhdpi',144),('xxxhdpi',192)]:
+              r = ic.resize((n, n), Image.LANCZOS)
+              for f in ('ic_launcher','ic_launcher_round','ic_launcher_foreground'):
+                  r.save(f'android/app/src/main/res/mipmap-{d}/{f}.png')
+          for f in glob.glob('android/app/src/main/res/drawable*/splash.png'):
+              w, h = Image.open(f).size
+              bg = Image.new('RGBA', (w, h), (32, 14, 88, 255))
+              s = int(min(w, h) * .38)
+              r = ic.resize((s, s), Image.LANCZOS)
+              bg.paste(r, ((w - s) // 2, (h - s) // 2), r)
+              bg.convert('RGB').save(f)
+          PY2
+          rm -rf android/app/src/main/res/mipmap-anydpi-v26
           npx cap sync android
       - name: Build debug APK
         run: |
