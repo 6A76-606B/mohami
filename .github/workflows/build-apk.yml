@@ -43,9 +43,10 @@ jobs:
           public class MainActivity extends BridgeActivity {
               @Override
               public void onCreate(Bundle savedInstanceState) {
+                  registerPlugin(FocusLockPlugin.class);
                   super.onCreate(savedInstanceState);
                   try {
-                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !LockStore.on(this)) {
                           String packageName = getPackageName();
                           PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
                           if (pm != null && !pm.isIgnoringBatteryOptimizations(packageName)) {
@@ -59,6 +60,645 @@ jobs:
               }
           }
           EOF
+          cat > android/app/src/main/java/com/mohami/app/FocusLockPlugin.java << 'EOF'
+          package com.mohami.app;
+
+          import android.content.ComponentName;
+          import android.content.ContentValues;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.ApplicationInfo;
+          import android.content.pm.PackageManager;
+          import android.content.pm.ResolveInfo;
+          import android.graphics.Bitmap;
+          import android.graphics.Canvas;
+          import android.graphics.drawable.Drawable;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Environment;
+          import android.provider.MediaStore;
+          import android.provider.Settings;
+          import android.text.TextUtils;
+          import android.util.Base64;
+
+          import com.getcapacitor.JSArray;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+
+          import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.OutputStream;
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.Comparator;
+          import java.util.HashSet;
+          import java.util.List;
+          import java.util.Set;
+
+          @CapacitorPlugin(name = "FocusLock")
+          public class FocusLockPlugin extends Plugin {
+
+              static boolean accessibilityOn(Context c) {
+                  try {
+                      String s = Settings.Secure.getString(c.getContentResolver(), Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+                      if (s == null) return false;
+                      String full = new ComponentName(c, FocusAccessibilityService.class).flattenToString();
+                      String shrt = new ComponentName(c, FocusAccessibilityService.class).flattenToShortString();
+                      TextUtils.SimpleStringSplitter sp = new TextUtils.SimpleStringSplitter(':');
+                      sp.setString(s);
+                      while (sp.hasNext()) {
+                          String x = sp.next();
+                          if (x.equalsIgnoreCase(full) || x.equalsIgnoreCase(shrt)) return true;
+                      }
+                  } catch (Exception e) {
+                  }
+                  return false;
+              }
+
+              static boolean blockedFromList(String p) {
+                  return p.equals("com.android.settings") || p.endsWith(".settings") || p.contains("packageinstaller")
+                          || p.equals("com.android.vending") || p.contains("permissioncontroller");
+              }
+
+              static String iconB64(Drawable d, int size) {
+                  try {
+                      Bitmap b = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888);
+                      Canvas cv = new Canvas(b);
+                      d.setBounds(0, 0, size, size);
+                      d.draw(cv);
+                      ByteArrayOutputStream o = new ByteArrayOutputStream();
+                      b.compress(Bitmap.CompressFormat.PNG, 90, o);
+                      return "data:image/png;base64," + Base64.encodeToString(o.toByteArray(), Base64.NO_WRAP);
+                  } catch (Exception e) {
+                      return "";
+                  }
+              }
+
+              private JSObject appObj(String pkg) {
+                  JSObject o = new JSObject();
+                  try {
+                      PackageManager pm = getContext().getPackageManager();
+                      ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
+                      o.put("pkg", pkg);
+                      o.put("label", String.valueOf(pm.getApplicationLabel(ai)));
+                      o.put("icon", iconB64(pm.getApplicationIcon(ai), 72));
+                  } catch (Exception e) {
+                      o.put("pkg", pkg);
+                      o.put("label", pkg);
+                      o.put("icon", "");
+                  }
+                  return o;
+              }
+
+              private JSObject statusObj() {
+                  Context c = getContext();
+                  LockStore.refresh(c);
+                  JSObject o = new JSObject();
+                  boolean on = LockStore.on(c);
+                  o.put("ready", accessibilityOn(c));
+                  o.put("active", on);
+                  o.put("remaining", on ? LockStore.remaining(c) : 0);
+                  o.put("total", LockStore.mins(c));
+                  o.put("pending", LockStore.pending(c));
+                  JSArray sel = new JSArray();
+                  if (on) {
+                      for (String p : LockStore.apps(c).split(",")) {
+                          if (p.length() > 0) sel.put(appObj(p));
+                      }
+                  }
+                  o.put("sel", sel);
+                  return o;
+              }
+
+              @PluginMethod
+              public void status(PluginCall call) {
+                  call.resolve(statusObj());
+              }
+
+              @PluginMethod
+              public void getApps(final PluginCall call) {
+                  new Thread(new Runnable() {
+                      @Override
+                      public void run() {
+                          try {
+                              Context c = getContext();
+                              PackageManager pm = c.getPackageManager();
+                              Intent mi = new Intent(Intent.ACTION_MAIN);
+                              mi.addCategory(Intent.CATEGORY_LAUNCHER);
+                              List<ResolveInfo> l = pm.queryIntentActivities(mi, 0);
+                              final List<String[]> rows = new ArrayList<String[]>();
+                              Set<String> seen = new HashSet<String>();
+                              for (ResolveInfo r : l) {
+                                  String p = r.activityInfo.packageName;
+                                  if (p.equals(c.getPackageName()) || blockedFromList(p) || !seen.add(p)) continue;
+                                  rows.add(new String[]{p, String.valueOf(r.loadLabel(pm))});
+                              }
+                              Collections.sort(rows, new Comparator<String[]>() {
+                                  @Override
+                                  public int compare(String[] a, String[] b) {
+                                      return a[1].compareToIgnoreCase(b[1]);
+                                  }
+                              });
+                              JSArray arr = new JSArray();
+                              for (String[] r : rows) {
+                                  JSObject o = new JSObject();
+                                  o.put("pkg", r[0]);
+                                  o.put("label", r[1]);
+                                  try {
+                                      o.put("icon", iconB64(pm.getApplicationIcon(r[0]), 64));
+                                  } catch (Exception e) {
+                                      o.put("icon", "");
+                                  }
+                                  arr.put(o);
+                              }
+                              JSObject res = new JSObject();
+                              res.put("apps", arr);
+                              call.resolve(res);
+                          } catch (Exception e) {
+                              call.reject("apps");
+                          }
+                      }
+                  }).start();
+              }
+
+              @PluginMethod
+              public void start(PluginCall call) {
+                  Context c = getContext();
+                  LockStore.refresh(c);
+                  if (LockStore.on(c)) {
+                      call.reject("already");
+                      return;
+                  }
+                  if (!accessibilityOn(c)) {
+                      call.reject("noperm");
+                      return;
+                  }
+                  Integer m = call.getInt("minutes", 0);
+                  JSArray a = call.getArray("apps");
+                  if (m == null || m < 5 || m > 1200 || a == null || a.length() < 1 || a.length() > 3) {
+                      call.reject("bad");
+                      return;
+                  }
+                  StringBuilder sb = new StringBuilder();
+                  try {
+                      for (int i = 0; i < a.length(); i++) {
+                          String p = a.getString(i);
+                          if (p == null || p.length() == 0 || p.contains(",") || blockedFromList(p)) {
+                              call.reject("bad");
+                              return;
+                          }
+                          if (sb.length() > 0) sb.append(",");
+                          sb.append(p);
+                      }
+                  } catch (Exception e) {
+                      call.reject("bad");
+                      return;
+                  }
+                  LockStore.start(c, m, sb.toString());
+                  call.resolve(statusObj());
+              }
+
+              @PluginMethod
+              public void claim(PluginCall call) {
+                  Context c = getContext();
+                  LockStore.refresh(c);
+                  JSObject o = new JSObject();
+                  o.put("mins", LockStore.claim(c));
+                  call.resolve(o);
+              }
+
+              @PluginMethod
+              public void launch(PluginCall call) {
+                  Context c = getContext();
+                  LockStore.refresh(c);
+                  String p = call.getString("pkg", "");
+                  if (!LockStore.on(c) || !LockStore.isChosen(c, p)) {
+                      call.reject("no");
+                      return;
+                  }
+                  try {
+                      Intent i = c.getPackageManager().getLaunchIntentForPackage(p);
+                      if (i == null) {
+                          call.reject("no");
+                          return;
+                      }
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      c.startActivity(i);
+                      call.resolve();
+                  } catch (Exception e) {
+                      call.reject("no");
+                  }
+              }
+
+              @PluginMethod
+              public void openAccessibility(PluginCall call) {
+                  try {
+                      Intent i = new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS);
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      getContext().startActivity(i);
+                      call.resolve();
+                  } catch (Exception e) {
+                      call.reject("fail");
+                  }
+              }
+
+              @PluginMethod
+              public void openAppInfo(PluginCall call) {
+                  try {
+                      Intent i = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
+                      i.setData(Uri.parse("package:" + getContext().getPackageName()));
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      getContext().startActivity(i);
+                      call.resolve();
+                  } catch (Exception e) {
+                      call.reject("fail");
+                  }
+              }
+
+              @PluginMethod
+              public void saveFile(PluginCall call) {
+                  String name = call.getString("name", "backup.json");
+                  String data = call.getString("data", "");
+                  try {
+                      byte[] b = data.getBytes("UTF-8");
+                      Context c = getContext();
+                      JSObject res = new JSObject();
+                      if (Build.VERSION.SDK_INT >= 29) {
+                          ContentValues v = new ContentValues();
+                          v.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
+                          v.put(MediaStore.MediaColumns.MIME_TYPE, "application/json");
+                          v.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+                          Uri u = c.getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
+                          OutputStream o = c.getContentResolver().openOutputStream(u);
+                          o.write(b);
+                          o.close();
+                          res.put("where", "Downloads");
+                      } else {
+                          File d = c.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+                          if (d != null && !d.exists()) d.mkdirs();
+                          File f = new File(d, name);
+                          FileOutputStream o = new FileOutputStream(f);
+                          o.write(b);
+                          o.close();
+                          res.put("where", f.getAbsolutePath());
+                      }
+                      call.resolve(res);
+                  } catch (Exception e) {
+                      call.reject("save");
+                  }
+              }
+          }
+          EOF
+          cat > android/app/src/main/java/com/mohami/app/LockStore.java << 'EOF'
+          package com.mohami.app;
+
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.media.AudioManager;
+          import android.os.SystemClock;
+          import android.provider.Settings;
+          import android.telecom.TelecomManager;
+          import android.view.inputmethod.InputMethodInfo;
+          import android.view.inputmethod.InputMethodManager;
+
+          public class LockStore {
+
+              static SharedPreferences sp(Context c) {
+                  return c.getApplicationContext().getSharedPreferences("focuslock", Context.MODE_PRIVATE);
+              }
+
+              static int boot(Context c) {
+                  try {
+                      return Settings.Global.getInt(c.getContentResolver(), "boot_count", -1);
+                  } catch (Exception e) {
+                      return -1;
+                  }
+              }
+
+              static boolean on(Context c) {
+                  return sp(c).getBoolean("on", false);
+              }
+
+              static int mins(Context c) {
+                  return sp(c).getInt("mins", 0);
+              }
+
+              static int pending(Context c) {
+                  return sp(c).getInt("pending", 0);
+              }
+
+              static String apps(Context c) {
+                  return sp(c).getString("apps", "");
+              }
+
+              static void start(Context c, int mins, String apps) {
+                  long el = SystemClock.elapsedRealtime();
+                  long ms = mins * 60000L;
+                  sp(c).edit().putBoolean("on", true).putInt("mins", mins).putString("apps", apps)
+                          .putLong("start_el", el).putLong("end_el", el + ms)
+                          .putLong("end_wall", System.currentTimeMillis() + ms).putInt("boot", boot(c)).commit();
+              }
+
+              // remaining milliseconds; uses the monotonic clock in the same boot, wall clock after a reboot
+              static long remaining(Context c) {
+                  SharedPreferences p = sp(c);
+                  if (!p.getBoolean("on", false)) return 0;
+                  long el = SystemClock.elapsedRealtime();
+                  boolean same = p.getInt("boot", -1) == boot(c) && el >= p.getLong("start_el", 0);
+                  long rem = same ? p.getLong("end_el", 0) - el : p.getLong("end_wall", 0) - System.currentTimeMillis();
+                  long cap = p.getInt("mins", 0) * 60000L;
+                  if (rem > cap) rem = cap;
+                  return rem;
+              }
+
+              // returns true only at the moment the lock just finished
+              static boolean refresh(Context c) {
+                  SharedPreferences p = sp(c);
+                  if (!p.getBoolean("on", false)) return false;
+                  if (remaining(c) > 0) return false;
+                  p.edit().putBoolean("on", false).putInt("pending", p.getInt("mins", 0)).commit();
+                  return true;
+              }
+
+              static int claim(Context c) {
+                  SharedPreferences p = sp(c);
+                  int m = p.getInt("pending", 0);
+                  if (m > 0) p.edit().putInt("pending", 0).commit();
+                  return m;
+              }
+
+              static boolean isChosen(Context c, String pkg) {
+                  for (String a : apps(c).split(",")) {
+                      if (a.equals(pkg)) return true;
+                  }
+                  return false;
+              }
+
+              static boolean allowed(Context c, String pkg) {
+                  if (pkg.equals(c.getPackageName())) return true;
+                  if (pkg.equals("com.android.systemui") || pkg.equals("android")) return true;
+                  if (isChosen(c, pkg)) return true;
+                  if (pkg.contains("permissioncontroller")) return true;
+                  boolean inCall = false;
+                  try {
+                      AudioManager am = (AudioManager) c.getSystemService(Context.AUDIO_SERVICE);
+                      int md = am.getMode();
+                      inCall = md == AudioManager.MODE_IN_CALL || md == AudioManager.MODE_RINGTONE;
+                  } catch (Exception e) {
+                  }
+                  if (inCall) {
+                      if (pkg.equals("com.android.phone") || pkg.equals("com.android.server.telecom") || pkg.equals("com.android.incallui")) return true;
+                      try {
+                          TelecomManager t = (TelecomManager) c.getSystemService(Context.TELECOM_SERVICE);
+                          if (pkg.equals(t.getDefaultDialerPackage())) return true;
+                      } catch (Exception e) {
+                      }
+                  }
+                  try {
+                      InputMethodManager im = (InputMethodManager) c.getSystemService(Context.INPUT_METHOD_SERVICE);
+                      for (InputMethodInfo i : im.getEnabledInputMethodList()) {
+                          if (i.getPackageName().equals(pkg)) return true;
+                      }
+                  } catch (Exception e) {
+                  }
+                  return false;
+              }
+          }
+          EOF
+          cat > android/app/src/main/java/com/mohami/app/FocusAccessibilityService.java << 'EOF'
+          package com.mohami.app;
+
+          import android.accessibilityservice.AccessibilityService;
+          import android.content.Intent;
+          import android.graphics.PixelFormat;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.WindowManager;
+          import android.view.accessibility.AccessibilityEvent;
+          import android.view.accessibility.AccessibilityNodeInfo;
+          import android.view.accessibility.AccessibilityWindowInfo;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+
+          import java.util.List;
+
+          public class FocusAccessibilityService extends AccessibilityService {
+
+              private final Handler h = new Handler(Looper.getMainLooper());
+              private long lastBounce = 0;
+              private View overlay = null;
+              private boolean lastBad = false;
+
+              private final Runnable loop = new Runnable() {
+                  @Override
+                  public void run() {
+                      try {
+                          scan();
+                      } catch (Exception e) {
+                      }
+                      h.postDelayed(this, 200);
+                  }
+              };
+
+              @Override
+              protected void onServiceConnected() {
+                  super.onServiceConnected();
+                  h.removeCallbacks(loop);
+                  h.post(loop);
+              }
+
+              @Override
+              public void onAccessibilityEvent(AccessibilityEvent e) {
+                  try {
+                      if (e != null && e.getEventType() == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && LockStore.on(this)) {
+                          CharSequence pk = e.getPackageName();
+                          CharSequence cn = e.getClassName();
+                          String p = pk == null ? "" : pk.toString();
+                          String c = cn == null ? "" : cn.toString().toLowerCase();
+                          if (c.contains("globalactions")) {
+                              performGlobalAction(GLOBAL_ACTION_BACK);
+                          }
+                          if (p.equals("com.android.systemui") && (c.contains("notificationshade") || c.contains("quicksettings")
+                                  || c.contains("notificationpanel") || c.contains("expandedpanel") || c.contains("shadewindow"))) {
+                              if (Build.VERSION.SDK_INT >= 31) performGlobalAction(GLOBAL_ACTION_DISMISS_NOTIFICATION_SHADE);
+                              else performGlobalAction(GLOBAL_ACTION_BACK);
+                          }
+                          if (p.length() > 0) {
+                              if (p.equals(getPackageName()) || LockStore.isChosen(this, p)) lastBad = false;
+                              else if (!LockStore.allowed(this, p)) lastBad = true;
+                          }
+                      }
+                      scan();
+                  } catch (Exception ex) {
+                  }
+              }
+
+              // looks at every application window on screen (including split-screen / pop-up windows)
+              private void scan() {
+                  if (!LockStore.on(this)) {
+                      lastBad = false;
+                      hideOverlay();
+                      return;
+                  }
+                  if (LockStore.refresh(this)) {
+                      lastBad = false;
+                      hideOverlay();
+                      bounce(true);
+                      return;
+                  }
+                  boolean bad = false, good = false, seen = false;
+                  int unreadable = 0;
+                  try {
+                      List<AccessibilityWindowInfo> ws = getWindows();
+                      if (ws != null) {
+                          for (AccessibilityWindowInfo w : ws) {
+                              if (w.getType() != AccessibilityWindowInfo.TYPE_APPLICATION) continue;
+                              AccessibilityNodeInfo r = w.getRoot();
+                              if (r == null) {
+                                  unreadable++;
+                                  continue;
+                              }
+                              CharSequence cs = r.getPackageName();
+                              if (cs == null) {
+                                  unreadable++;
+                                  continue;
+                              }
+                              seen = true;
+                              String p = cs.toString();
+                              if (p.equals(getPackageName()) || LockStore.isChosen(this, p)) good = true;
+                              else if (!LockStore.allowed(this, p)) bad = true;
+                          }
+                      }
+                  } catch (Exception ex) {
+                  }
+                  if (!seen) {
+                      try {
+                          AccessibilityNodeInfo r = getRootInActiveWindow();
+                          CharSequence cs = r == null ? null : r.getPackageName();
+                          if (cs != null) {
+                              String p = cs.toString();
+                              if (p.equals(getPackageName()) || LockStore.isChosen(this, p)) good = true;
+                              else if (!LockStore.allowed(this, p)) bad = true;
+                          }
+                      } catch (Exception ex) {
+                      }
+                  }
+                  // an app window we cannot read (app blocks accessibility): fall back to the last window event
+                  if (!bad && lastBad && (unreadable > 0 || !seen)) bad = true;
+                  if (bad) {
+                      showOverlay();
+                      bounce(false);
+                  } else if (good) {
+                      hideOverlay();
+                  }
+              }
+
+              private void bounce(boolean force) {
+                  long now = System.currentTimeMillis();
+                  if (!force && now - lastBounce < 400) return;
+                  lastBounce = now;
+                  try {
+                      Intent i = new Intent(this, MainActivity.class);
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                      startActivity(i);
+                  } catch (Exception ex) {
+                  }
+              }
+
+              private void showOverlay() {
+                  if (overlay != null) return;
+                  try {
+                      WindowManager wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+                      LinearLayout l = new LinearLayout(this);
+                      l.setOrientation(LinearLayout.VERTICAL);
+                      l.setGravity(Gravity.CENTER);
+                      l.setPadding(48, 48, 48, 48);
+                      l.setBackgroundColor(0xFF080D1C);
+                      TextView t = new TextView(this);
+                      t.setText("\uD83D\uDD12 مانع التشتت شغّال\nالتطبيق ده مش من التطبيقات اللي اخترتها");
+                      t.setTextColor(0xFFF4F7FF);
+                      t.setTextSize(18);
+                      t.setGravity(Gravity.CENTER);
+                      Button b = new Button(this);
+                      b.setText("ارجع لمهامي");
+                      b.setOnClickListener(new View.OnClickListener() {
+                          @Override
+                          public void onClick(View v) {
+                              bounce(true);
+                          }
+                      });
+                      l.addView(t, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+                      LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                      bp.topMargin = 48;
+                      l.addView(b, bp);
+                      WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                              ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
+                              WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                              WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                              PixelFormat.OPAQUE);
+                      wm.addView(l, lp);
+                      overlay = l;
+                  } catch (Exception ex) {
+                      overlay = null;
+                  }
+              }
+
+              private void hideOverlay() {
+                  if (overlay == null) return;
+                  try {
+                      WindowManager wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+                      wm.removeView(overlay);
+                  } catch (Exception ex) {
+                  }
+                  overlay = null;
+              }
+
+              @Override
+              public void onInterrupt() {
+              }
+
+              @Override
+              public boolean onUnbind(Intent intent) {
+                  h.removeCallbacks(loop);
+                  hideOverlay();
+                  return super.onUnbind(intent);
+              }
+          }
+          EOF
+          mkdir -p android/app/src/main/res/xml android/app/src/main/res/values
+          cat > android/app/src/main/res/xml/focus_accessibility.xml << 'EOF'
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowsChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagRetrieveInteractiveWindows"
+              android:canRetrieveWindowContent="true"
+              android:notificationTimeout="50"
+              android:description="@string/focus_desc" />
+          EOF
+          cat > android/app/src/main/res/values/focus_strings.xml << 'EOF'
+          <resources>
+              <string name="focus_desc">مانع التشتت: يراقب اسم التطبيق المفتوح فقط ويمنع أي تطبيق غير اللي اخترتها أثناء الجلسة. لا يقرأ محتوى الشاشة ولا أي بيانات.</string>
+          </resources>
+          EOF
+          python3 - << 'PYM'
+          m = 'android/app/src/main/AndroidManifest.xml'
+          s = open(m, encoding='utf-8').read()
+          svc = '<service android:name="com.mohami.app.FocusAccessibilityService" android:exported="false" android:label="مانع التشتت" android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"><intent-filter><action android:name="android.accessibilityservice.AccessibilityService"/></intent-filter><meta-data android:name="android.accessibilityservice" android:resource="@xml/focus_accessibility"/></service>'
+          q = '<queries><intent><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent></queries>'
+          s = s.replace('</application>', svc + '</application>', 1)
+          s = s.replace('</manifest>', q + '</manifest>', 1)
+          open(m, 'w', encoding='utf-8').write(s)
+          print('manifest patched:', 'FocusAccessibilityService' in s and '<queries>' in s)
+          PYM
           mkdir -p android/app/src/main/res/raw android/app/src/main/res/drawable
           cat > android/app/src/main/res/drawable/ic_stat.xml << 'EOF'
           <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
@@ -93,7 +733,7 @@ jobs:
                   r.save(f'android/app/src/main/res/mipmap-{d}/{f}.png')
           for f in glob.glob('android/app/src/main/res/drawable*/splash.png'):
               w, h = Image.open(f).size
-              bg = Image.new('RGBA', (w, h), (32, 14, 88, 255))
+              bg = Image.new('RGBA', (w, h), (8, 13, 28, 255))
               s = int(min(w, h) * .38)
               r = ic.resize((s, s), Image.LANCZOS)
               bg.paste(r, ((w - s) // 2, (h - s) // 2), r)
